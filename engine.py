@@ -133,6 +133,40 @@ def merge_piano_other(folder):
     piano.unlink()
 
 
+def analyze_result(original, folder=None):
+    from music_analysis import analyze_files
+    parts = [folder / (stem + '.wav') for stem in ('bass','guitar','other')
+             if folder is not None and (folder / (stem + '.wav')).is_file()] if folder else []
+    drums = folder / 'drums.wav' if folder and (folder / 'drums.wav').is_file() else None
+    report = analyze_files(original,parts,drums=drums)
+    if folder:
+        temporary = folder / '분석결과.json.tmp'
+        temporary.write_text(json.dumps(report,ensure_ascii=False,indent=2,allow_nan=False),encoding='utf-8')
+        os.replace(temporary,folder / '분석결과.json')
+    emit('analysis', report=report)
+    return report
+
+
+def analyze_existing(source, folder, workdir):
+    folder = Path(folder).resolve() if folder else None
+    if folder and not (folder / 'other.wav').is_file():
+        raise ValueError('분리된 반주 파일이 있는 결과 폴더를 선택해주세요.')
+    workdir = Path(workdir).resolve()
+    workdir.mkdir(parents=True,exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.separating-analysis-',dir=workdir) as temporary:
+        emit('temporary',path=temporary)
+        original = None
+        if source:
+            import imageio_ffmpeg
+            original = Path(temporary) / 'original.wav'
+            run([imageio_ffmpeg.get_ffmpeg_exe(),'-nostdin','-hide_banner','-loglevel','error','-y',
+                 '-i',source,'-vn','-ar','44100','-ac','2','-c:a','pcm_s16le',original])
+        if original is None and folder is None:
+            raise ValueError('원곡 또는 분리 결과를 선택해주세요.')
+        emit('stage',text='BPM·메인 키 정밀 분석 중…')
+        analyze_result(original,folder)
+
+
 def separate(source, output, device):
     source, output = Path(source).resolve(), Path(output).resolve()
     if not source.is_file():
@@ -176,6 +210,11 @@ def separate(source, output, device):
             file = generated / (stem + '.wav')
             if not file.is_file() or file.stat().st_size <= 44:
                 raise RuntimeError(stem + ' 결과 파일이 생성되지 않았습니다.')
+        emit('stage', text='원곡·드럼 BPM 및 반주 메인 키 정밀 분석 중…')
+        try:
+            analyze_result(converted, generated)
+        except Exception as error:
+            emit('log', text='음원 분리는 완료했지만 BPM·키 분석은 실패했습니다: '+str(error))
         (generated / '분리정보.json').write_text(json.dumps({
             'source': str(source), 'model': MODEL, 'device': selected,
             'created': dt.datetime.now().isoformat(), 'stems': list(STEMS),
@@ -195,11 +234,17 @@ def main():
     split.add_argument('--input', required=True)
     split.add_argument('--output', required=True)
     split.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
+    analysis = commands.add_parser('analyze')
+    analysis.add_argument('--input')
+    analysis.add_argument('--result-dir')
+    analysis.add_argument('--work-dir', default=str(ROOT / '결과'))
     args = parser.parse_args()
     if args.command == 'install':
         install(args.accelerator)
     elif args.command == 'probe':
         probe()
+    elif args.command == 'analyze':
+        analyze_existing(args.input,args.result_dir,args.work_dir)
     elif args.command == 'model':
         load_model()
     else:

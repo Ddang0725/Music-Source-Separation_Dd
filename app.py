@@ -129,6 +129,8 @@ class App(tk.Tk):
         self.cancelled = threading.Event()
         self.engine_ready = False
         self.result_dir = None
+        self.analysis_result_dir = None
+        self.analysis_text = tk.StringVar(value='BPM — · 메인 키 — (정밀 분석)')
         self.source = tk.StringVar()
         self.output = tk.StringVar(value=str(ROOT / '결과'))
         self.device = tk.StringVar(value='자동 (GPU 우선)')
@@ -183,7 +185,12 @@ class App(tk.Tk):
         outer = tk.Frame(self, bg=BG)
         outer.pack(fill='both', expand=True, padx=24, pady=18)
         self.label(outer, '음원분리댕', size=25, bold=True).pack(anchor='w')
-        self.label(outer, '한 곡을 다섯 개의 파트로, 내 연습에 맞게.', color=MUTED).pack(anchor='w', pady=(2, 14))
+        analysis_row = tk.Frame(outer,bg=BG)
+        analysis_row.pack(fill='x',pady=(2,10))
+        self.label(analysis_row,textvariable=self.analysis_text,color=PURPLE,size=10).pack(side='left')
+        self.analysis_button = self.button(analysis_row,'BPM·키 정밀 분석',self.start_analysis)
+        self.analysis_button.configure(pady=4)
+        self.analysis_button.pack(side='right')
         top = tk.Frame(outer, bg=BG)
         top.pack(fill='x')
         left = tk.Frame(top, bg=CARD, padx=16, pady=13)
@@ -297,6 +304,51 @@ class App(tk.Tk):
             ('오디오 파일', '*.mp3 *.wav *.flac *.m4a *.ogg *.aac *.wma'), ('모든 파일', '*.*')])
         if file:
             self.source.set(file)
+            self.analysis_result_dir = None
+            self.analysis_text.set('BPM — · 메인 키 — (정밀 분석)')
+
+    def show_analysis(self, report):
+        bpm, key = report.get('bpm'), report.get('key')
+        tempo = f"약 {bpm['value']:g} BPM" if bpm else 'BPM 판단 어려움'
+        tonal = key['label'] if key else '키 판단 어려움'
+        if not key and report.get('key_source')=='분리 후 분석 가능':
+            tonal = '키는 분리 후 분석'
+        uncertain = any(value and value.get('certainty')=='낮음' for value in (bpm,key))
+        kind = '정밀 추정' if report.get('mode')=='precise' else '이전 분석 · 재분석 필요'
+        self.analysis_text.set(f'{tempo} · {tonal} ({kind}'+(' · 확실도 낮음' if uncertain else '')+')')
+        if key and key.get('possible_modulation'):
+            self.append_log('구간별 키 후보가 다릅니다. 전조 또는 조성 모호 가능성은 분석결과.json의 key_sections에서 확인하세요.')
+        self.append_log(report.get('note',''))
+
+    def load_saved_analysis(self, folder, restore_source=False):
+        self.analysis_result_dir = folder
+        self.analysis_text.set('BPM — · 메인 키 — (분석 버튼으로 확인)')
+        if restore_source:
+            self.source.set('')
+        try:
+            file = folder / '분석결과.json'
+            if file.is_file():
+                self.show_analysis(json.loads(file.read_text(encoding='utf-8-sig')))
+            if restore_source:
+                metadata = json.loads((folder / '분리정보.json').read_text(encoding='utf-8-sig'))
+                original = metadata.get('source','')
+                self.source.set(original if Path(original).is_file() else '')
+        except (OSError,ValueError,TypeError,KeyError) as error:
+            self.append_log('기존 분석 정보 읽기: '+str(error))
+
+    def start_analysis(self):
+        source = self.source.get()
+        folder = self.analysis_result_dir
+        if not source and folder is None:
+            messagebox.showinfo('분석할 음악','원곡 파일 또는 기존 분리 결과를 먼저 선택해주세요.')
+            return
+        command = [ENV_PYTHON,ROOT/'engine.py','analyze','--work-dir',self.output.get()]
+        if source:
+            command += ['--input',source]
+        if folder:
+            command += ['--result-dir',folder]
+        self.stop_audio()
+        self.launch('analyze',command)
 
     def choose_output(self):
         folder = filedialog.askdirectory(title='결과 저장 폴더 선택')
@@ -308,6 +360,7 @@ class App(tk.Tk):
         for button in self.actions + [self.install_button]:
             button.configure(state='disabled' if value else 'normal')
         self.start_button.configure(state='normal' if not value and self.engine_ready else 'disabled')
+        self.analysis_button.configure(state='normal' if not value and ENV_PYTHON.is_file() else 'disabled')
         self.devices.configure(state='disabled' if value else 'readonly')
         self.cancel_button.configure(state='normal' if value else 'disabled')
         if value:
@@ -344,6 +397,8 @@ class App(tk.Tk):
         self.player.unload()
         self.set_playback_enabled(False)
         self.result_dir = None
+        self.analysis_result_dir = None
+        self.analysis_text.set('BPM — · 메인 키 — (분리 후 정밀 분석)')
         for button in self.stem_buttons:
             button.configure(state='disabled')
         self.open_button.configure(state='disabled')
@@ -356,7 +411,7 @@ class App(tk.Tk):
         self.mode = mode
         self.cancelled.clear()
         self.set_busy(True)
-        self.state_text.set({'probe': 'AI 엔진 확인 중…', 'install': 'AI 엔진 설치 시작…', 'separate': '음원 분리 준비 중…'}[mode])
+        self.state_text.set({'probe': 'AI 엔진 확인 중…', 'install': 'AI 엔진 설치 시작…', 'separate': '음원 분리 준비 중…', 'analyze': 'BPM·키 정밀 분석 준비 중…'}[mode])
         output = self.output.get()
         threading.Thread(target=self.worker, args=(mode, command, output), daemon=True).start()
 
@@ -430,9 +485,12 @@ class App(tk.Tk):
                     self.append_log(event['text'])
                 elif kind == 'result':
                     self.result_dir = Path(event['path'])
+                    self.load_saved_analysis(self.result_dir)
                     self.append_log('저장 완료: ' + event['path'])
                     self.player.load(self.result_dir)
                     self.open_button.configure(state='normal')
+                elif kind == 'analysis':
+                    self.show_analysis(event['report'])
                 elif kind == 'playback_loaded':
                     self.timeline.configure(to=event['duration'])
                     self.time_value.set(0)
@@ -464,6 +522,8 @@ class App(tk.Tk):
                         self.check_engine()
                     elif event['mode'] == 'probe':
                         self.state_text.set('준비 완료 · 음악 파일을 선택해주세요.')
+                    elif event['mode'] == 'analyze':
+                        self.state_text.set('BPM·키 정밀 분석 완료 · 추정값을 확인해주세요.')
                     else:
                         self.state_text.set('분리 완료 · 각 파트를 들어보세요.')
         except queue.Empty:
@@ -501,6 +561,7 @@ class App(tk.Tk):
         directory = filedialog.askdirectory(title='다섯 파트의 WAV 파일이 들어 있는 결과 폴더 선택')
         if directory:
             self.result_dir = Path(directory)
+            self.load_saved_analysis(self.result_dir, restore_source=True)
             self.stop_audio()
             self.set_playback_enabled(False)
             self.player.load(self.result_dir)
